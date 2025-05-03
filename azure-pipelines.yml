@@ -1,0 +1,157 @@
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+      - hotfix/*
+  paths:
+    exclude:
+      - '*.md'
+      - '.gitignore'
+      - 'docs/*'
+
+pr:
+  autoCancel: true
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  npm_config_cache: $(Pipeline.Workspace)/.npm
+  DOCKER_BUILDKIT: 1
+  NODE_VERSION: '20.x'
+
+stages:
+  - stage: Build
+    displayName: 'Build & Test'
+    jobs:
+      - job: BuildTest
+        displayName: 'Build and Test'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+            displayName: 'Install Node.js'
+
+          - task: Cache@2
+            inputs:
+              key: 'npm | "$(Agent.OS)" | package-lock.json'
+              restoreKeys: |
+                npm | "$(Agent.OS)"
+              path: $(npm_config_cache)
+            displayName: 'Cache npm packages'
+
+          - script: |
+              npm ci
+            displayName: 'Install Dependencies'
+
+          - script: |
+              npm run lint
+            displayName: 'Run ESLint'
+            continueOnError: true
+
+          - script: |
+              npm run build
+            displayName: 'Build Application'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/dist'
+              artifact: 'dist'
+              publishLocation: 'pipeline'
+            displayName: 'Publish Build Artifacts'
+
+  - stage: Security
+    displayName: 'Security Scan'
+    dependsOn: []
+    jobs:
+      - job: SecurityScan
+        displayName: 'Security Scanning'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm audit
+            displayName: 'NPM Security Audit'
+            continueOnError: true
+
+          - task: WhiteSource@21
+            inputs:
+              cwd: '$(System.DefaultWorkingDirectory)'
+              projectName: '$(Build.Repository.Name)'
+            displayName: 'WhiteSource Scan'
+
+  - stage: DeployDev
+    displayName: 'Deploy to Development'
+    dependsOn: 
+      - Build
+      - Security
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    variables:
+      - group: DevSecrets
+    jobs:
+      - deployment: DeployDev
+        displayName: 'Deploy to Dev Environment'
+        environment: 'development'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: dist
+                
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: '$(AZURE_SUBSCRIPTION)'
+                    appName: '$(DEV_APP_NAME)'
+                    package: '$(Pipeline.Workspace)/dist/**/*.zip'
+                    deploymentMethod: 'auto'
+
+  - stage: DeployProd
+    displayName: 'Deploy to Production'
+    dependsOn: 
+      - Build
+      - Security
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    variables:
+      - group: ProdSecrets
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Deploy to Production Environment'
+        environment: 'production'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: dist
+                
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: '$(AZURE_SUBSCRIPTION)'
+                    appName: '$(PROD_APP_NAME)'
+                    package: '$(Pipeline.Workspace)/dist/**/*.zip'
+                    deploymentMethod: 'auto'
+                    
+                - task: AzureAppServiceManage@0
+                  inputs:
+                    azureSubscription: '$(AZURE_SUBSCRIPTION)'
+                    Action: 'Swap Slots'
+                    WebAppName: '$(PROD_APP_NAME)'
+                    SourceSlot: 'staging'
+                    SwapWithProduction: true
+                  condition: succeeded()
